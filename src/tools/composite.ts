@@ -48,7 +48,7 @@ export const compositeTools: ToolDef[] = [
         .union([agentStatusSchema, z.array(agentStatusSchema).min(1)])
         .optional()
         .describe(
-          "Status(es) to wait for before reading back (default: idle).",
+          "Status(es) to wait for before reading back. Default: idle and done, which both mean ready for input.",
         ),
       timeout_ms: z
         .number()
@@ -68,7 +68,7 @@ export const compositeTools: ToolDef[] = [
     run: async (a): Promise<ToolResult> => {
       const target = String(a.target);
       const statuses = toStatusList(a.wait_status);
-      const until = statuses.length > 0 ? statuses : ["idle"];
+      const until = statuses.length > 0 ? statuses : ["idle", "done"];
       const timeout = (a.timeout_ms as number) ?? 120_000;
       const lines = (a.read_lines as number) ?? 200;
 
@@ -95,7 +95,7 @@ export const compositeTools: ToolDef[] = [
         "read",
         target,
         "--source",
-        "visible",
+        "detection",
         "--lines",
         String(lines),
         "--format",

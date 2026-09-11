@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { agentStatusSchema, toStatusList, targetSchema, sourceSchema, flag, ok, formatResult, } from "./types.js";
+import { agentStatusSchema, toStatusList, targetSchema, sourceSchema, agentSourceSchema, flag, ok, formatResult, } from "./types.js";
 import { runHerdr } from "../herdr.js";
 import { resolvePaneId } from "./resolve.js";
 export const agentTools = [
@@ -20,7 +20,7 @@ export const agentTools = [
         description: "Read another agent's terminal output to gather context (contextual handoff). Defaults to the visible screen, which is the most reliable source. Keep `lines` small to avoid flooding context. To find valid targets first, call `herdr_agent_list`.",
         inputSchema: {
             target: targetSchema,
-            source: sourceSchema,
+            source: agentSourceSchema,
             lines: z
                 .number()
                 .int()

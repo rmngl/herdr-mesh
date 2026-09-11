@@ -59,6 +59,16 @@ export const sourceSchema = z
   .optional()
   .describe("Which portion of the pane buffer to read (default: visible).");
 
+/**
+ * `agent read` additionally accepts `detection` — the bottom-buffer slice herdr's
+ * detector inspects. Prefer it when reasoning about agent state: the user can
+ * scroll the visible viewport, but the detection source is scroll-independent.
+ */
+export const agentSourceSchema = z
+  .enum(["visible", "recent", "recent-unwrapped", "detection"])
+  .optional()
+  .describe("Which portion of the pane buffer to read (default: visible).");
+
 /** herdr's semantic agent lifecycle states. */
 export const agentStatusSchema = z.enum([
   "idle",

@@ -6,6 +6,7 @@ import {
   toStatusList,
   targetSchema,
   sourceSchema,
+  agentSourceSchema,
   flag,
   ok,
   formatResult,
@@ -34,7 +35,7 @@ export const agentTools: ToolDef[] = [
       "Read another agent's terminal output to gather context (contextual handoff). Defaults to the visible screen, which is the most reliable source. Keep `lines` small to avoid flooding context. To find valid targets first, call `herdr_agent_list`.",
     inputSchema: {
       target: targetSchema,
-      source: sourceSchema,
+      source: agentSourceSchema,
       lines: z
         .number()
         .int()

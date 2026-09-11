@@ -34,7 +34,7 @@ export const compositeTools = [
             wait_status: z
                 .union([agentStatusSchema, z.array(agentStatusSchema).min(1)])
                 .optional()
-                .describe("Status(es) to wait for before reading back (default: idle)."),
+                .describe("Status(es) to wait for before reading back. Default: idle and done, which both mean ready for input."),
             timeout_ms: z
                 .number()
                 .int()
@@ -53,7 +53,7 @@ export const compositeTools = [
         run: async (a) => {
             const target = String(a.target);
             const statuses = toStatusList(a.wait_status);
-            const until = statuses.length > 0 ? statuses : ["idle"];
+            const until = statuses.length > 0 ? statuses : ["idle", "done"];
             const timeout = a.timeout_ms ?? 120_000;
             const lines = a.read_lines ?? 200;
             // One call delivers, submits and waits. If it reports a stall, do NOT retry
@@ -77,7 +77,7 @@ export const compositeTools = [
                 "read",
                 target,
                 "--source",
-                "visible",
+                "detection",
                 "--lines",
                 String(lines),
                 "--format",
