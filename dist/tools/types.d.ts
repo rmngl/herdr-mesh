@@ -30,6 +30,10 @@ export declare function execTool(tool: ToolDef, args: Record<string, unknown>): 
 /** Common reusable schema fragments. */
 export declare const targetSchema: z.ZodString;
 export declare const sourceSchema: z.ZodOptional<z.ZodEnum<["visible", "recent", "recent-unwrapped"]>>;
+/** herdr's semantic agent lifecycle states. */
+export declare const agentStatusSchema: z.ZodEnum<["idle", "working", "blocked", "done", "unknown"]>;
+/** Normalize a single status or a list into a list, for repeatable `--until`. */
+export declare function toStatusList(value: unknown): string[];
 /** Append `--flag value` when value is defined. */
 export declare function flag(argv: string[], name: string, value: unknown): void;
 /** Append a boolean `--flag` / `--no-flag` pair when defined. */

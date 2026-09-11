@@ -32,6 +32,22 @@ export const sourceSchema = z
     .enum(["visible", "recent", "recent-unwrapped"])
     .optional()
     .describe("Which portion of the pane buffer to read (default: visible).");
+/** herdr's semantic agent lifecycle states. */
+export const agentStatusSchema = z.enum([
+    "idle",
+    "working",
+    "blocked",
+    "done",
+    "unknown",
+]);
+/** Normalize a single status or a list into a list, for repeatable `--until`. */
+export function toStatusList(value) {
+    if (Array.isArray(value))
+        return value.map(String);
+    if (value === undefined || value === null || value === "")
+        return [];
+    return [String(value)];
+}
 /** Append `--flag value` when value is defined. */
 export function flag(argv, name, value) {
     if (value !== undefined && value !== null && value !== "") {

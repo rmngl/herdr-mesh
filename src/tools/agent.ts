@@ -1,11 +1,17 @@
 import { z } from "zod";
 import {
   type ToolDef,
+  type ToolResult,
+  agentStatusSchema,
+  toStatusList,
   targetSchema,
   sourceSchema,
   flag,
-  boolFlag,
+  ok,
+  formatResult,
 } from "./types.js";
+import { runHerdr } from "../herdr.js";
+import { resolvePaneId } from "./resolve.js";
 
 export const agentTools: ToolDef[] = [
   {
@@ -53,17 +59,23 @@ export const agentTools: ToolDef[] = [
       target: targetSchema,
       text: z.string().describe("Literal text to deliver to the agent."),
     },
-    buildArgs: (a) => ["agent", "send", String(a.target), String(a.text)],
+    // herdr has no `agent send`; typing without submitting is a pane-level
+    // operation, so resolve the agent's pane first.
+    run: async (a): Promise<ToolResult> => {
+      const paneId = await resolvePaneId(String(a.target));
+      const res = await runHerdr(["pane", "send-text", paneId, String(a.text)]);
+      return ok(formatResult(res));
+    },
   },
   {
     name: "herdr_agent_wait",
     description:
-      "Block until an agent reaches a given status. Useful to synchronize a handoff (wait for the other agent to become idle/done before sending the next step).",
+      "Block until an agent reaches one of the given statuses. Useful to synchronize a handoff (wait for the other agent to become idle/done before sending the next step). Note that `idle` and `done` both mean the agent is ready for input.",
     inputSchema: {
       target: targetSchema,
       status: z
-        .enum(["idle", "working", "blocked", "done", "unknown"])
-        .describe("Status to wait for."),
+        .union([agentStatusSchema, z.array(agentStatusSchema).min(1)])
+        .describe("Status (or statuses) to wait for; the first to occur wins."),
       timeout_ms: z
         .number()
         .int()
@@ -74,7 +86,9 @@ export const agentTools: ToolDef[] = [
     // Allow the subprocess to outlive the requested CLI timeout.
     timeoutMs: 120_000,
     buildArgs: (a) => {
-      const argv = ["agent", "wait", String(a.target), "--status", String(a.status)];
+      const argv = ["agent", "wait", String(a.target)];
+      // `--until` is repeatable and replaced `--status` in herdr 0.9.
+      for (const s of toStatusList(a.status)) argv.push("--until", s);
       flag(argv, "--timeout", a.timeout_ms);
       return argv;
     },
@@ -88,13 +102,17 @@ export const agentTools: ToolDef[] = [
       match: z.string().describe("Text (or regex if `regex` is true) to wait for."),
       regex: z.boolean().optional().describe("Treat `match` as a regex."),
       source: sourceSchema,
+      lines: z.number().int().positive().max(2000).optional(),
       timeout_ms: z.number().int().positive().optional(),
     },
     timeoutMs: 120_000,
     buildArgs: (a) => {
-      const argv = ["wait", "output", String(a.pane_id), "--match", String(a.match)];
-      boolFlag(argv, "--regex", undefined, a.regex);
+      // herdr 0.9: `pane wait-output`; --match and --regex are alternatives
+      // rather than a boolean modifying --match.
+      const argv = ["pane", "wait-output", String(a.pane_id)];
+      argv.push(a.regex ? "--regex" : "--match", String(a.match));
       flag(argv, "--source", a.source);
+      flag(argv, "--lines", a.lines);
       flag(argv, "--timeout", a.timeout_ms);
       return argv;
     },
@@ -102,32 +120,43 @@ export const agentTools: ToolDef[] = [
   {
     name: "herdr_agent_start",
     description:
-      "Start a new agent in a fresh terminal. Works with any agent herdr supports (pi, omp, claude, codex, opencode, hermes, qodercli, …). Provide the agent's launch command/argv. Optionally place it in a workspace/tab or split from the current pane.",
+      "Start a recognized agent in an EXISTING, idle shell pane. `agent start` never creates, splits or moves layout — call `herdr_pane_split` (or create a tab/workspace) first and pass the resulting pane_id here. Blocks until herdr detects the agent and it is ready.",
     inputSchema: {
-      name: z.string().describe("Name/label for the new agent terminal."),
-      argv: z
-        .array(z.string())
-        .min(1)
+      name: z
+        .string()
+        .regex(/^[a-z][a-z0-9_-]{0,31}$/)
         .describe(
-          "Command and arguments to launch the agent, e.g. ['claude'], ['codex'], ['opencode'].",
+          "Live agent name, unique among running agents: [a-z][a-z0-9_-]{0,31}.",
         ),
-      cwd: z.string().optional().describe("Working directory for the new agent."),
-      workspace: z.string().optional().describe("Workspace id to place the agent in."),
-      tab: z.string().optional().describe("Tab id to place the agent in."),
-      split: z
-        .enum(["right", "down"])
+      kind: z
+        .string()
+        .describe(
+          "Agent kind herdr knows how to launch, e.g. claude, codex, gemini, cursor, opencode, copilot, amp, grok, qwen.",
+        ),
+      pane_id: z
+        .string()
+        .describe("Existing pane to start the agent in. The pane must be an idle shell."),
+      args: z
+        .array(z.string())
         .optional()
-        .describe("Split direction from the current pane."),
-      focus: z.boolean().optional().describe("Focus the new agent (default: focus)."),
+        .describe("Extra arguments passed through to the agent binary."),
+      timeout_ms: z
+        .number()
+        .int()
+        .min(3001)
+        .max(300_000)
+        .optional()
+        .describe("Startup timeout in ms (herdr requires >3000 and <=300000)."),
     },
+    timeoutMs: 120_000,
     buildArgs: (a) => {
+      // herdr 0.9: `agent start <name> --kind KIND --pane ID [--timeout MS] [-- args]`
       const argv = ["agent", "start", String(a.name)];
-      flag(argv, "--cwd", a.cwd);
-      flag(argv, "--workspace", a.workspace);
-      flag(argv, "--tab", a.tab);
-      flag(argv, "--split", a.split);
-      boolFlag(argv, "--focus", "--no-focus", a.focus);
-      argv.push("--", ...(a.argv as string[]));
+      flag(argv, "--kind", a.kind);
+      flag(argv, "--pane", a.pane_id);
+      flag(argv, "--timeout", a.timeout_ms);
+      const extra = (a.args as string[] | undefined) ?? [];
+      if (extra.length > 0) argv.push("--", ...extra);
       return argv;
     },
   },

@@ -1,77 +1,55 @@
 import { z } from "zod";
 import { runHerdr } from "../herdr.js";
-import { type ToolDef, type ToolResult, ok, formatResult, targetSchema } from "./types.js";
-
-/** Recursively find the first `pane_id` value in a parsed herdr JSON response. */
-function findPaneId(node: unknown): string | undefined {
-  if (!node || typeof node !== "object") return undefined;
-  if (Array.isArray(node)) {
-    for (const item of node) {
-      const found = findPaneId(item);
-      if (found) return found;
-    }
-    return undefined;
-  }
-  const obj = node as Record<string, unknown>;
-  if (typeof obj.pane_id === "string") return obj.pane_id;
-  for (const v of Object.values(obj)) {
-    const found = findPaneId(v);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-/** Resolve a target (agent name/label/id) to its pane id, needed to send keys.
- * Tries `agent get` first, then `pane get` so a raw pane id also works. */
-async function resolvePaneId(target: string): Promise<string> {
-  for (const cmd of [["agent", "get", target], ["pane", "get", target]]) {
-    try {
-      const res = await runHerdr(cmd);
-      const paneId = findPaneId(res.json);
-      if (paneId) return paneId;
-    } catch {
-      /* try next resolver */
-    }
-  }
-  throw new Error(`could not resolve pane_id for target "${target}"`);
-}
+import {
+  type ToolDef,
+  type ToolResult,
+  agentStatusSchema,
+  toStatusList,
+  ok,
+  formatResult,
+  targetSchema,
+} from "./types.js";
+import { resolvePaneId } from "./resolve.js";
 
 export const compositeTools: ToolDef[] = [
   {
     name: "herdr_relay",
     description:
-      "Deliver a message to an agent AND submit it (types the text, then presses Enter). Use this for normal agent-to-agent messaging — it avoids the common mistake of sending text that never gets submitted. Set submit=false to type without Enter.",
+      "Deliver a message to an agent AND submit it. Use this for normal agent-to-agent messaging — it avoids the common mistake of sending text that never gets submitted. Set submit=false to type without Enter. herdr refuses to prompt an agent that is currently `blocked` on an approval prompt.",
     inputSchema: {
       target: targetSchema,
       text: z.string().describe("Message/prompt to deliver to the agent."),
-      submit: z
-        .boolean()
-        .optional()
-        .describe("Press Enter after typing (default true)."),
+      submit: z.boolean().optional().describe("Submit after typing (default true)."),
     },
     run: async (a): Promise<ToolResult> => {
       const target = String(a.target);
       const submit = a.submit !== false;
-      // Resolve pane first so a bad target fails before we type anything.
-      const paneId = submit ? await resolvePaneId(target) : undefined;
-      await runHerdr(["agent", "send", target, String(a.text)]);
-      if (submit && paneId) await runHerdr(["pane", "send-keys", paneId, "enter"]);
-      return ok(
-        `Delivered to "${target}"${submit ? " and submitted (Enter)" : " (not submitted)"}.`,
-      );
+
+      if (!submit) {
+        const paneId = await resolvePaneId(target);
+        const res = await runHerdr(["pane", "send-text", paneId, String(a.text)]);
+        return ok(`${formatResult(res)}\n\nTyped into "${target}" (not submitted).`);
+      }
+
+      // `agent prompt` types and submits in one step and honours bracketed paste,
+      // so a multi-line message is not interpreted as a series of submissions.
+      const res = await runHerdr(["agent", "prompt", target, String(a.text)]);
+      return ok(`${formatResult(res)}\n\nDelivered to "${target}" and submitted.`);
     },
   },
   {
     name: "herdr_handoff",
     description:
-      "Hand a task to another agent and wait for its result in one step: deliver the message (with Enter), wait until the agent reaches a status (default idle), then read its output back. Use this for review/fix/verify handoffs so the multi-step chain can't break midway. Returns the target agent's resulting output.",
+      "Hand a task to another agent and wait for its result in one step: deliver the message, wait until the agent is ready again, then read its output back. Use this for review/fix/verify handoffs so the multi-step chain can't break midway. Returns the target agent's resulting output.",
     inputSchema: {
       target: targetSchema,
       message: z.string().describe("Task/prompt to hand to the agent."),
       wait_status: z
-        .enum(["idle", "working", "blocked", "done", "unknown"])
+        .union([agentStatusSchema, z.array(agentStatusSchema).min(1)])
         .optional()
-        .describe("Status to wait for before reading back (default: idle)."),
+        .describe(
+          "Status(es) to wait for before reading back (default: idle).",
+        ),
       timeout_ms: z
         .number()
         .int()
@@ -89,23 +67,27 @@ export const compositeTools: ToolDef[] = [
     timeoutMs: 180_000,
     run: async (a): Promise<ToolResult> => {
       const target = String(a.target);
-      const status = (a.wait_status as string) ?? "idle";
+      const statuses = toStatusList(a.wait_status);
+      const until = statuses.length > 0 ? statuses : ["idle"];
       const timeout = (a.timeout_ms as number) ?? 120_000;
       const lines = (a.read_lines as number) ?? 200;
 
-      const paneId = await resolvePaneId(target);
-      await runHerdr(["agent", "send", target, String(a.message)]);
-      await runHerdr(["pane", "send-keys", paneId, "enter"]);
+      // One call delivers, submits and waits. If it reports a stall, do NOT retry
+      // the prompt: a stall does not prove the text was never sent, and resending
+      // would hand the same task over twice.
+      const argv = ["agent", "prompt", target, String(a.message), "--wait"];
+      for (const s of until) argv.push("--until", s);
+      argv.push("--timeout", String(timeout));
 
-      let waitNote = `reached ${status}`;
+      let waitNote = `reached ${until.join(" or ")}`;
       try {
-        await runHerdr(
-          ["agent", "wait", target, "--status", status, "--timeout", String(timeout)],
-          { timeoutMs: timeout + 10_000 },
-        );
+        await runHerdr(argv, { timeoutMs: timeout + 10_000 });
       } catch (err) {
-        // Don't lose the output if the wait times out — read whatever is there.
-        waitNote = `wait did not complete (${err instanceof Error ? err.message : String(err)})`;
+        // Don't lose the output if the wait times out — read whatever is there and
+        // let the caller decide, rather than silently re-prompting.
+        waitNote = `wait did not complete (${
+          err instanceof Error ? err.message : String(err)
+        }) — the message may still have been delivered, so read the output before retrying`;
       }
 
       const read = await runHerdr([
