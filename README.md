@@ -94,8 +94,9 @@ agents through a standard interface.
 
 It is **agent-agnostic**: tools operate on whatever agents herdr recognizes — `pi`, `omp`,
 `claude`, `codex`, `opencode`, `hermes`, `qodercli`, and any future integration. Targets
-accept a terminal id, agent name, reported agent label, or legacy pane id; nothing is tied
-to a specific agent type. Use `herdr_integration_status` to see what's available.
+accept a **live agent name** (`[a-z][a-z0-9_-]{0,31}`) or the **pane id hosting the agent**;
+terminal ids and agent-kind labels are not accepted. Nothing is tied to a specific agent
+type. Use `herdr_integration_status` to see what's available.
 
 ## How it works
 
@@ -110,7 +111,9 @@ protocol implementation — herdr's own version/protocol handling stays authorit
 
 - Node.js 18+
 - [herdr](https://herdr.dev) installed and a server running (`herdr status` shows `running`).
-  Set `HERDR_BIN` if `herdr` is not on `PATH`.
+  **Requires herdr ≥ 0.9.5.** Set `HERDR_BIN` if `herdr` is not on `PATH`.
+  herdr-mesh 0.2.0 targets the 0.9.5 CLI (`agent prompt`, `pane wait-output`, `agent start --kind`);
+  it does not work against older herdr releases.
 
 ## Install (recommended)
 
@@ -242,19 +245,35 @@ These are the tool names exposed to the agent — listed here for reference, not
 you to type.
 
 **Agent messaging & context (core)**
-- `herdr_relay` — deliver a message to an agent **and submit it** (types + Enter).
-  Preferred for messaging; avoids the "typed but never submitted" pitfall.
+- `herdr_relay` — deliver a message to an agent **and submit it** (uses `agent prompt`).
+  Preferred for messaging; avoids the "typed but never submitted" pitfall. `submit: false`
+  types via `pane send-text` instead.
 - `herdr_handoff` — send a task, wait for the agent to finish, and read its result
-  back — in one step. Preferred for review/fix/verify loops so the chain can't break.
+  back — in one step. Accepts `wait_status`, `read_source`, `read_lines`, `timeout_ms`.
+  Preferred for review/fix/verify loops so the chain can't break.
 - `herdr_agent_list` — list agents with state (idle/working/blocked/done)
 - `herdr_agent_get` — agent details
-- `herdr_agent_read` — read another agent's pane output (context handoff)
-- `herdr_agent_send` — low-level: type literal text to an agent (no Enter)
-- `herdr_agent_wait` — block until an agent reaches a status
+- `herdr_agent_read` — read another agent's pane output (sources: `visible`, `recent`,
+  `recent-unwrapped`, `detection`)
+- `herdr_agent_send` — low-level: type literal text to an agent (no Enter; uses `pane send-text`)
+- `herdr_agent_send_keys` — send key presses (`enter`, `esc`, `tab`, `ctrl+c`, `up`, …)
+- `herdr_agent_prompt` — submit a prompt (text + Enter); optional `wait`, `until`, `timeout_ms`
+- `herdr_agent_wait` — block until an agent reaches a status. `until` accepts one state or
+  an array; `status` remains as a legacy alias. Omit both for herdr's default
+  (idle, done or blocked).
 - `herdr_wait_output` — block until a pane's output matches text/regex
+  (`pane wait-output`); supports `source`, `lines`, `timeout_ms`, `raw`
 
 **Agent lifecycle & discovery**
-- `herdr_agent_start` — spawn a new agent terminal (any supported agent)
+- `herdr_agent_start` — start a supported agent in a pane. Inputs: `name` (required),
+  `kind` (required: `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`,
+  `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`,
+  `hermes`, `kilo`, `qodercli`, `qwen`, `letta`, `maki`, `muse`), and optional `args`
+  (extra agent args after `--`), `pane_id`, `workspace`, `split_from` + `direction`,
+  `split`, `cwd`, `focus`, `timeout_ms`. Without `pane_id`, it creates a workspace, tab or
+  pane first and cleans it up if startup fails.
+  - **Breaking since 0.1.0:** `argv` → `kind` + `args`; `tab` was removed. `split`
+    (right/down) still works and splits the current pane.
 - `herdr_agent_rename`, `herdr_agent_focus`
 - `herdr_integration_status` — list agent integrations herdr knows about and their status
 
@@ -276,11 +295,19 @@ use the tools correctly and what developers should understand.
 
 - **Sending messages / commands**
   - Deliver text only: `herdr_agent_send` (does not press Enter)
-  - Also submit it: follow with `herdr_pane_send_keys` sending `enter`
+  - Submit text: `herdr_agent_prompt` / `herdr_relay`
+  - Send special keys: `herdr_agent_send_keys` or `herdr_pane_send_keys`
+    (`enter`, `esc`, `tab`, `ctrl+c`, `up`, `down`, `left`, `right`, …)
   - Run a shell command: `herdr_pane_run` (types **and** presses Enter) — simplest
+- **Targets**: use a live agent name or the pane id hosting it. Terminal ids and
+  agent-kind labels are rejected by herdr 0.9.5; call `herdr_agent_list` to discover
+  valid names.
+- **Key names**: `esc` is canonical (`escape` is accepted and normalized); `ctrl-c`,
+  `Ctrl-Shift-C` and other modifier forms are rewritten to `ctrl+c` / `ctrl+shift+C`.
 - **Reading output**: for context retrieval, `source: "visible"` most reliably
   returns on-screen content. `recent` / `recent-unwrapped` can be empty when there
-  is no tracked command-output region.
+  is no tracked command-output region; `detection` reads what herdr used for agent
+  detection.
 
 ## Context & session sharing
 

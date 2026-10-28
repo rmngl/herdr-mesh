@@ -88,8 +88,9 @@ MCP 클라이언트든 다른 에이전트의 pane을 읽고, 메시지를 보�
 
 **에이전트 비종속(agent-agnostic):** tool은 herdr가 인지하는 모든 에이전트
 (`pi`, `omp`, `claude`, `codex`, `opencode`, `hermes`, `qodercli` 및 향후 통합)에 동작합니다.
-target에는 terminal id, 에이전트 이름, 보고된 에이전트 라벨, 레거시 pane id를 쓸 수 있으며
-특정 에이전트 타입에 묶여 있지 않습니다. 사용 가능한 목록은 `herdr_integration_status`로 확인하세요.
+target에는 **실행 중인 에이전트 이름**(`[a-z][a-z0-9_-]{0,31}`) 또는 **그 에이전트가 있는 pane
+id**를 쓸 수 있으며, terminal id와 에이전트 종류 라벨은 허용되지 않습니다. 특정 에이전트
+타입에 묶여 있지 않습니다. 사용 가능한 목록은 `herdr_integration_status`로 확인하세요.
 
 ## 동작 방식
 
@@ -104,7 +105,9 @@ MCP 클라이언트 ──stdio(MCP)──> herdr-mesh ──exec "herdr …"─
 
 - Node.js 18 이상
 - [herdr](https://herdr.dev) 설치 및 서버 실행 상태(`herdr status`가 `running` 표시).
-  `herdr`가 `PATH`에 없으면 `HERDR_BIN` 환경변수로 경로를 지정하세요.
+  **herdr ≥ 0.9.5 필요.** `herdr`가 `PATH`에 없으면 `HERDR_BIN` 환경변수로 경로를 지정하세요.
+  herdr-mesh 0.2.0은 0.9.5 CLI(`agent prompt`, `pane wait-output`, `agent start --kind`)를
+  대상으로 하며, 이전 herdr 버전에서는 동작하지 않습니다.
 
 ## 설치 (권장)
 
@@ -230,19 +233,34 @@ tool 이름을 직접 입력하지 않습니다. 평소처럼 에이전트(Claud
 아래는 에이전트에게 노출되는 tool 이름입니다 — 참고용이며, 사람이 입력하는 것이 아닙니다.
 
 **에이전트 메시지 & 컨텍스트 (핵심)**
-- `herdr_relay` — 에이전트에 메시지를 전달하고 **제출까지**(타이핑 + Enter). 메시지 전송엔
-  이걸 우선 사용 — "쳤는데 제출 안 됨" 실수를 막아줍니다.
+- `herdr_relay` — 에이전트에 메시지를 전달하고 **제출까지**(`agent prompt`). 메시지 전송엔
+  이걸 우선 사용 — "쳤는데 제출 안 됨" 실수를 막아줍니다. `submit: false`면 `pane send-text`로
+  글자만 입력합니다.
 - `herdr_handoff` — 작업을 보내고, 에이전트가 끝날 때까지 기다린 뒤, 결과를 읽어오는 것까지
-  한 번에. 리뷰/수정/검증 루프에 우선 사용 — 체인이 중간에 끊기지 않습니다.
+  한 번에. `wait_status`, `read_source`, `read_lines`, `timeout_ms`를 받습니다.
+  리뷰/수정/검증 루프에 우선 사용 — 체인이 중간에 끊기지 않습니다.
 - `herdr_agent_list` — 에이전트 목록과 상태(idle/working/blocked/done)
 - `herdr_agent_get` — 에이전트 상세
-- `herdr_agent_read` — 다른 에이전트의 pane 출력 읽기 (컨텍스트 핸드오프)
-- `herdr_agent_send` — 저수준: 에이전트에 텍스트만 입력 (Enter 없음)
-- `herdr_agent_wait` — 에이전트가 특정 상태가 될 때까지 대기
+- `herdr_agent_read` — 다른 에이전트의 pane 출력 읽기 (source: `visible`, `recent`,
+  `recent-unwrapped`, `detection`)
+- `herdr_agent_send` — 저수준: 에이전트에 텍스트만 입력 (Enter 없음; `pane send-text` 사용)
+- `herdr_agent_send_keys` — 키 입력 전송 (`enter`, `esc`, `tab`, `ctrl+c`, `up`, …)
+- `herdr_agent_prompt` — 프롬프트 제출(텍스트 + Enter). 선택: `wait`, `until`, `timeout_ms`
+- `herdr_agent_wait` — 에이전트가 특정 상태가 될 때까지 대기. `until`은 단일 상태 또는 배열을
+  받고, `status`는 레거시 별칭으로 유지됩니다. 둘 다 생략하면 herdr 기본값
+  (idle, done 또는 blocked)을 기다립니다.
 - `herdr_wait_output` — pane 출력이 텍스트/정규식과 일치할 때까지 대기
+  (`pane wait-output`). `source`, `lines`, `timeout_ms`, `raw` 지원
 
 **에이전트 생애주기 & 탐색**
-- `herdr_agent_start` — 새 에이전트 터미널 생성 (지원되는 모든 에이전트)
+- `herdr_agent_start` — pane에서 지원 에이전트를 시작합니다. 입력: `name`(필수),
+  `kind`(필수: `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`,
+  `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`,
+  `kilo`, `qodercli`, `qwen`, `letta`, `maki`, `muse`)와 선택 `args`(`--` 뒤 에이전트 인자),
+  `pane_id`, `workspace`, `split_from` + `direction`, `split`, `cwd`, `focus`, `timeout_ms`.
+  `pane_id`가 없으면 workspace/tab/pane을 먼저 만들고, 시작에 실패하면 정리합니다.
+  - **0.1.0 대비 호환성 깨짐:** `argv` → `kind` + `args`; `tab` 제거. `split`(right/down)은
+    계속 동작하며 현재 pane을 분할합니다.
 - `herdr_agent_rename`, `herdr_agent_focus`
 - `herdr_integration_status` — herdr가 인지하는 에이전트 통합 목록과 상태
 
@@ -264,10 +282,18 @@ tool 이름을 직접 입력하지 않습니다. 평소처럼 에이전트(Claud
 
 - **메시지/명령 전송**
   - 글자만 전달: `herdr_agent_send` (Enter 누르지 않음)
-  - 제출까지 시키기: 이어서 `herdr_pane_send_keys`로 `enter` 전송
+  - 제출까지: `herdr_agent_prompt` / `herdr_relay`
+  - 특수 키 전송: `herdr_agent_send_keys` 또는 `herdr_pane_send_keys`
+    (`enter`, `esc`, `tab`, `ctrl+c`, `up`, `down`, `left`, `right`, …)
   - 셸 명령 실행: `herdr_pane_run` (입력 + Enter 한 번에) — 가장 간편
+- **target**: 실행 중인 에이전트 이름 또는 그 에이전트가 있는 pane id를 사용하세요.
+  herdr 0.9.5는 terminal id와 에이전트 종류 라벨을 거부합니다. 유효한 이름은
+  `herdr_agent_list`로 확인하세요.
+- **키 이름**: `esc`가 표준이며(`escape`도 허용되어 정규화됨), `ctrl-c`·`Ctrl-Shift-C` 같은
+  수정자 표기는 `ctrl+c` / `ctrl+shift+C`로 변환됩니다.
 - **출력 읽기**: 컨텍스트 회수에는 `source: "visible"`이 화면 내용을 가장 안정적으로 반환합니다.
   `recent` / `recent-unwrapped`는 추적된 명령 출력 영역이 없으면 빈 값일 수 있습니다.
+  `detection`은 herdr가 에이전트 감지에 사용한 내용을 읽습니다.
 
 ## 컨텍스트 & 세션 공유에 대하여
 
