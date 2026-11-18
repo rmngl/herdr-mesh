@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { sourceSchema, flag, boolFlag } from "./types.js";
+import { readSourceSchema, waitSourceSchema, flag, boolFlag, normalizeKey, } from "./types.js";
 export const paneTools = [
     {
         name: "herdr_pane_list",
@@ -24,7 +24,7 @@ export const paneTools = [
         description: "Read a pane's terminal output. Keep `lines` small to avoid flooding context.",
         inputSchema: {
             pane_id: z.string(),
-            source: sourceSchema,
+            source: readSourceSchema,
             lines: z.number().int().positive().max(2000).optional(),
         },
         buildArgs: (a) => {
@@ -32,6 +32,40 @@ export const paneTools = [
             flag(argv, "--source", a.source);
             flag(argv, "--lines", a.lines ?? 200);
             argv.push("--format", "text");
+            return argv;
+        },
+    },
+    {
+        name: "herdr_wait_output",
+        description: "Block until a pane's output matches given text (or regex). Useful to wait for a build/command to finish in another agent's pane.",
+        inputSchema: {
+            pane_id: z.string().describe("Pane id to watch."),
+            match: z.string().describe("Text (or regex if `regex` is true) to wait for."),
+            regex: z.boolean().optional().describe("Treat `match` as a regex."),
+            source: waitSourceSchema,
+            lines: z
+                .number()
+                .int()
+                .positive()
+                .optional()
+                .describe("Restrict the searched snapshot to this many lines."),
+            timeout_ms: z.number().int().positive().optional(),
+            raw: z
+                .boolean()
+                .optional()
+                .describe("Keep ANSI escape sequences while matching."),
+        },
+        timeoutMs: 120_000,
+        buildArgs: (a) => {
+            const argv = ["pane", "wait-output", String(a.pane_id)];
+            if (a.regex)
+                argv.push("--regex", String(a.match));
+            else
+                argv.push("--match", String(a.match));
+            flag(argv, "--source", a.source);
+            flag(argv, "--lines", a.lines);
+            flag(argv, "--timeout", a.timeout_ms);
+            boolFlag(argv, "--raw", undefined, a.raw);
             return argv;
         },
     },
@@ -68,12 +102,17 @@ export const paneTools = [
     },
     {
         name: "herdr_pane_send_keys",
-        description: "Send one or more key names to a pane (e.g. 'enter', 'ctrl-c', 'escape').",
+        description: "Send one or more key names to a pane. Valid names include `enter`, `esc`, `tab`, `ctrl+c`, `up`, `down`, `left`, `right`. Modifier forms like `ctrl-c` are normalized automatically.",
         inputSchema: {
             pane_id: z.string(),
             keys: z.array(z.string()).min(1).describe("Key names to send in order."),
         },
-        buildArgs: (a) => ["pane", "send-keys", String(a.pane_id), ...a.keys],
+        buildArgs: (a) => [
+            "pane",
+            "send-keys",
+            String(a.pane_id),
+            ...a.keys.map(normalizeKey),
+        ],
     },
     {
         name: "herdr_pane_close",

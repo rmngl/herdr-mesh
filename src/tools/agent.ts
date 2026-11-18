@@ -1,11 +1,129 @@
 import { z } from "zod";
+import { runHerdr } from "../herdr.js";
+import { setTimeout as sleep } from "node:timers/promises";
 import {
   type ToolDef,
+  type ToolResult,
+  type ToolContext,
   targetSchema,
-  sourceSchema,
+  statusEnum,
+  readSourceSchema,
   flag,
   boolFlag,
+  ok,
+  formatResult,
+  normalizeKey,
+  extractPaneId,
+  resolvePaneId,
 } from "./types.js";
+
+const AGENT_KINDS = [
+  "pi",
+  "claude",
+  "codex",
+  "gemini",
+  "cursor",
+  "devin",
+  "agy",
+  "cline",
+  "omp",
+  "mastracode",
+  "opencode",
+  "copilot",
+  "kimi",
+  "kiro",
+  "droid",
+  "amp",
+  "grok",
+  "hermes",
+  "kilo",
+  "qodercli",
+  "qwen",
+  "letta",
+  "maki",
+  "muse",
+] as const;
+
+const START_ATTEMPTS = 5;
+const START_RETRY_DELAY_MS = 500;
+
+type Created = { kind: "workspace" | "tab" | "pane"; id: string };
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Startup failures caused by the new pane's shell not being ready yet. */
+function isPaneStartupError(err: unknown): boolean {
+  return /agent_pane_not_found|agent_pane_unavailable|agent_start_input_failed|not at (?:its )?(?:interactive )?shell prompt/i.test(
+    errorMessage(err),
+  );
+}
+
+function isAgentNotReady(err: unknown): boolean {
+  return /agent_not_ready/.test(errorMessage(err));
+}
+
+/** Read an id from a documented herdr result shape, e.g. result.tab.tab_id. */
+function resultId(
+  json: unknown,
+  section: "tab" | "workspace",
+  field: "tab_id" | "workspace_id",
+): string | undefined {
+  const result =
+    json && typeof json === "object"
+      ? (json as { result?: Record<string, unknown> }).result
+      : undefined;
+  const value = result?.[section];
+  if (!value || typeof value !== "object") return undefined;
+  const id = (value as Record<string, unknown>)[field];
+  return typeof id === "string" ? id : undefined;
+}
+
+/** Best-effort cleanup of a workspace/tab/pane created by agent_start. */
+async function cleanupCreated(created: Created | undefined): Promise<void> {
+  if (!created) return;
+  try {
+    if (created.kind === "workspace") {
+      await runHerdr(["workspace", "close", created.id]);
+    } else if (created.kind === "tab") {
+      await runHerdr(["tab", "close", created.id]);
+    } else {
+      await runHerdr(["pane", "close", created.id]);
+    }
+  } catch {
+    /* cleanup is best effort; keep the original error */
+  }
+}
+
+async function startAgent(
+  name: string,
+  kind: string,
+  paneId: string,
+  extraArgs: string[] | undefined,
+  timeoutMs: number | undefined,
+  ctx: ToolContext,
+): Promise<{ ok: true; text: string } | { ok: false; error: unknown }> {
+  const argv = ["agent", "start", name, "--kind", kind, "--pane", paneId];
+  flag(argv, "--timeout", timeoutMs);
+  if (Array.isArray(extraArgs) && extraArgs.length > 0) {
+    argv.push("--", ...extraArgs);
+  }
+
+  for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+    try {
+      const result = await runHerdr(argv, { timeoutMs: ctx.timeoutMs });
+      return { ok: true, text: formatResult(result) };
+    } catch (err) {
+      if (isPaneStartupError(err) && attempt < START_ATTEMPTS) {
+        await sleep(START_RETRY_DELAY_MS);
+        continue;
+      }
+      return { ok: false, error: err };
+    }
+  }
+  return { ok: false, error: new Error("agent start failed") };
+}
 
 export const agentTools: ToolDef[] = [
   {
@@ -28,7 +146,9 @@ export const agentTools: ToolDef[] = [
       "Read another agent's terminal output to gather context (contextual handoff). Defaults to the visible screen, which is the most reliable source. Keep `lines` small to avoid flooding context. To find valid targets first, call `herdr_agent_list`.",
     inputSchema: {
       target: targetSchema,
-      source: sourceSchema,
+      source: readSourceSchema.describe(
+        "Which portion of the agent pane buffer to read (default: visible).",
+      ),
       lines: z
         .number()
         .int()
@@ -48,22 +168,84 @@ export const agentTools: ToolDef[] = [
   {
     name: "herdr_agent_send",
     description:
-      "Low-level: write literal text to an agent WITHOUT pressing Enter (the text is typed but not submitted). For normal agent-to-agent messaging prefer `herdr_relay` (types + Enter) or `herdr_handoff` (send + wait + read). First call `herdr_agent_list` if you're unsure of the target.",
+      "Low-level: write literal text to an agent WITHOUT pressing Enter (the text is typed but not submitted). For normal agent-to-agent messaging prefer `herdr_relay` (prompt + submit) or `herdr_handoff` (send + wait + read). First call `herdr_agent_list` if you're unsure of the target.",
     inputSchema: {
       target: targetSchema,
       text: z.string().describe("Literal text to deliver to the agent."),
     },
-    buildArgs: (a) => ["agent", "send", String(a.target), String(a.text)],
+    run: async (a): Promise<ToolResult> => {
+      const target = String(a.target);
+      const paneId = await resolvePaneId(target);
+      await runHerdr(["pane", "send-text", paneId, String(a.text)]);
+      return ok(`Typed text to "${target}" (not submitted).`);
+    },
+  },
+  {
+    name: "herdr_agent_send_keys",
+    description:
+      "Send key presses to an agent (e.g. 'enter', 'esc', 'tab', 'ctrl+c', 'up'). Keys are normalized to herdr's canonical names.",
+    inputSchema: {
+      target: targetSchema,
+      keys: z.array(z.string()).min(1).describe("Key names to send in order."),
+    },
+    buildArgs: (a) => [
+      "agent",
+      "send-keys",
+      String(a.target),
+      ...(a.keys as string[]).map(normalizeKey),
+    ],
+  },
+  {
+    name: "herdr_agent_prompt",
+    description:
+      "Submit a prompt to an agent (types the text and presses Enter). With `wait`, block until the first matching state is observed after submission; `until` and `timeout_ms` also imply `wait`. Failures include `agent_blocked` (the agent was already blocked; no input was sent), `agent_prompt_stalled` (no working/blocked state was observed within 5s), and `timeout` (the caller timeout expired).",
+    inputSchema: {
+      target: targetSchema,
+      text: z.string().describe("Prompt text to submit."),
+      wait: z
+        .boolean()
+        .optional()
+        .describe("Wait for a matching state after submission."),
+      until: z
+        .union([statusEnum, z.array(statusEnum)])
+        .optional()
+        .describe("State(s) to match with `wait`; repeatable. Default: idle, done or blocked."),
+      timeout_ms: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Max time to wait in milliseconds."),
+    },
+    timeoutMs: 120_000,
+    buildArgs: (a) => {
+      const argv = ["agent", "prompt", String(a.target), String(a.text)];
+      // herdr 0.9.5 rejects --until/--timeout unless --wait is present.
+      const wait =
+        a.wait === true || a.until !== undefined || a.timeout_ms !== undefined;
+      boolFlag(argv, "--wait", undefined, wait);
+      const until = a.until as string | string[] | undefined;
+      for (const status of Array.isArray(until) ? until : until ? [until] : []) {
+        argv.push("--until", status);
+      }
+      flag(argv, "--timeout", a.timeout_ms);
+      return argv;
+    },
   },
   {
     name: "herdr_agent_wait",
     description:
-      "Block until an agent reaches a given status. Useful to synchronize a handoff (wait for the other agent to become idle/done before sending the next step).",
+      "Block until an agent reaches a status. With no status/until, herdr waits for idle, done or blocked. Use `until` (repeatable via an array) to match exact states; the legacy `status` input is still accepted and `until` wins when both are given.",
     inputSchema: {
       target: targetSchema,
+      until: z
+        .union([statusEnum, z.array(statusEnum)])
+        .optional()
+        .describe("State(s) to wait for; arrays emit one --until per value."),
       status: z
-        .enum(["idle", "working", "blocked", "done", "unknown"])
-        .describe("Status to wait for."),
+        .union([statusEnum, z.array(statusEnum)])
+        .optional()
+        .describe("Legacy status (single or array; use `until` instead)."),
       timeout_ms: z
         .number()
         .int()
@@ -74,27 +256,11 @@ export const agentTools: ToolDef[] = [
     // Allow the subprocess to outlive the requested CLI timeout.
     timeoutMs: 120_000,
     buildArgs: (a) => {
-      const argv = ["agent", "wait", String(a.target), "--status", String(a.status)];
-      flag(argv, "--timeout", a.timeout_ms);
-      return argv;
-    },
-  },
-  {
-    name: "herdr_wait_output",
-    description:
-      "Block until a pane's output matches given text (or regex). Useful to wait for a build/command to finish in another agent's pane.",
-    inputSchema: {
-      pane_id: z.string().describe("Pane id to watch."),
-      match: z.string().describe("Text (or regex if `regex` is true) to wait for."),
-      regex: z.boolean().optional().describe("Treat `match` as a regex."),
-      source: sourceSchema,
-      timeout_ms: z.number().int().positive().optional(),
-    },
-    timeoutMs: 120_000,
-    buildArgs: (a) => {
-      const argv = ["wait", "output", String(a.pane_id), "--match", String(a.match)];
-      boolFlag(argv, "--regex", undefined, a.regex);
-      flag(argv, "--source", a.source);
+      const argv = ["agent", "wait", String(a.target)];
+      const until = (a.until ?? a.status) as string | string[] | undefined;
+      for (const status of Array.isArray(until) ? until : until ? [until] : []) {
+        argv.push("--until", status);
+      }
       flag(argv, "--timeout", a.timeout_ms);
       return argv;
     },
@@ -102,33 +268,163 @@ export const agentTools: ToolDef[] = [
   {
     name: "herdr_agent_start",
     description:
-      "Start a new agent in a fresh terminal. Works with any agent herdr supports (pi, omp, claude, codex, opencode, hermes, qodercli, …). Provide the agent's launch command/argv. Optionally place it in a workspace/tab or split from the current pane.",
+      "Start a supported agent in an existing pane. Creates a workspace, tab or pane first unless `pane_id` is given. The pane must be at an interactive shell prompt; startup retries briefly while the new shell initializes. Returns `agent_not_ready` as a normal result if the agent is blocked during startup — the name is still usable with herdr_agent_read and herdr_agent_send_keys.",
     inputSchema: {
-      name: z.string().describe("Name/label for the new agent terminal."),
-      argv: z
+      name: z
+        .string()
+        .regex(/^[a-z][a-z0-9_-]{0,31}$/)
+        .describe("Live agent name (unique, [a-z][a-z0-9_-]{0,31})."),
+      kind: z.enum(AGENT_KINDS).describe("Supported agent kind."),
+      args: z
         .array(z.string())
-        .min(1)
-        .describe(
-          "Command and arguments to launch the agent, e.g. ['claude'], ['codex'], ['opencode'].",
-        ),
-      cwd: z.string().optional().describe("Working directory for the new agent."),
-      workspace: z.string().optional().describe("Workspace id to place the agent in."),
-      tab: z.string().optional().describe("Tab id to place the agent in."),
+        .optional()
+        .describe("Extra arguments passed to the agent command after '--'."),
+      pane_id: z
+        .string()
+        .optional()
+        .describe("Existing shell pane at its prompt (skips creation)."),
+      workspace: z
+        .string()
+        .optional()
+        .describe("Workspace id in which to create a new tab."),
+      split_from: z
+        .string()
+        .optional()
+        .describe("Pane id to split, creating the new pane for the agent."),
+      direction: z
+        .enum(["right", "down"])
+        .optional()
+        .describe("Split direction when using `split_from` (default: right)."),
       split: z
         .enum(["right", "down"])
         .optional()
-        .describe("Split direction from the current pane."),
-      focus: z.boolean().optional().describe("Focus the new agent (default: focus)."),
+        .describe("Legacy: split the current pane in this direction."),
+      cwd: z.string().optional().describe("Working directory for the new agent."),
+      focus: z
+        .boolean()
+        .optional()
+        .describe("Focus the new agent afterwards (default: false)."),
+      timeout_ms: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Wait for interactive readiness (herdr default 30000, max 300000)."),
     },
-    buildArgs: (a) => {
-      const argv = ["agent", "start", String(a.name)];
-      flag(argv, "--cwd", a.cwd);
-      flag(argv, "--workspace", a.workspace);
-      flag(argv, "--tab", a.tab);
-      flag(argv, "--split", a.split);
-      boolFlag(argv, "--focus", "--no-focus", a.focus);
-      argv.push("--", ...(a.argv as string[]));
-      return argv;
+    timeoutMs: 120_000,
+    run: async (a, ctx): Promise<ToolResult> => {
+      const name = String(a.name);
+      const kind = String(a.kind);
+      const extraArgs = Array.isArray(a.args) ? (a.args as string[]) : undefined;
+      const startTimeout =
+        typeof a.timeout_ms === "number" ? (a.timeout_ms as number) : undefined;
+      let paneId: string;
+      let created: Created | undefined;
+
+      if (a.pane_id) {
+        paneId = String(a.pane_id);
+      } else if (a.split_from) {
+        const argv = [
+          "pane",
+          "split",
+          String(a.split_from),
+          "--direction",
+          String(a.direction ?? "right"),
+        ];
+        flag(argv, "--cwd", a.cwd);
+        argv.push("--no-focus");
+        const result = await runHerdr(argv, { timeoutMs: ctx.timeoutMs });
+        const id = extractPaneId(result.json);
+        if (!id) throw new Error("herdr pane split did not return a pane id");
+        paneId = id;
+        created = { kind: "pane", id };
+      } else if (a.split) {
+        const argv = [
+          "pane",
+          "split",
+          "--current",
+          "--direction",
+          String(a.split),
+        ];
+        flag(argv, "--cwd", a.cwd);
+        argv.push("--no-focus");
+        let result;
+        try {
+          result = await runHerdr(argv, { timeoutMs: ctx.timeoutMs });
+        } catch (err) {
+          throw new Error(
+            `could not split the current pane (${errorMessage(err)}). ` +
+              "Pass `pane_id` or `split_from` when the MCP server is not running inside a herdr pane.",
+          );
+        }
+        const id = extractPaneId(result.json);
+        if (!id) throw new Error("herdr pane split did not return a pane id");
+        paneId = id;
+        created = { kind: "pane", id };
+      } else if (a.workspace) {
+        const argv = ["tab", "create", "--workspace", String(a.workspace)];
+        flag(argv, "--cwd", a.cwd);
+        flag(argv, "--label", name);
+        argv.push("--no-focus");
+        const result = await runHerdr(argv, { timeoutMs: ctx.timeoutMs });
+        const tabId = resultId(result.json, "tab", "tab_id");
+        const id = extractPaneId(result.json);
+        if (!id) {
+          await cleanupCreated(
+            tabId ? { kind: "tab", id: tabId } : undefined,
+          );
+          throw new Error("herdr tab create did not return a pane id");
+        }
+        paneId = id;
+        created = tabId
+          ? { kind: "tab", id: tabId }
+          : { kind: "pane", id };
+      } else {
+        const argv = ["workspace", "create"];
+        flag(argv, "--cwd", a.cwd);
+        flag(argv, "--label", name);
+        argv.push("--no-focus");
+        const result = await runHerdr(argv, { timeoutMs: ctx.timeoutMs });
+        const workspaceId = resultId(result.json, "workspace", "workspace_id");
+        const id = extractPaneId(result.json);
+        if (!id) {
+          await cleanupCreated(
+            workspaceId ? { kind: "workspace", id: workspaceId } : undefined,
+          );
+          throw new Error("herdr workspace create did not return a pane id");
+        }
+        paneId = id;
+        created = workspaceId
+          ? { kind: "workspace", id: workspaceId }
+          : { kind: "pane", id };
+      }
+
+      const started = await startAgent(
+        name,
+        kind,
+        paneId,
+        extraArgs,
+        startTimeout,
+        ctx,
+      );
+
+      if (!started.ok) {
+        if (isAgentNotReady(started.error)) {
+          return ok(
+            `Agent "${name}" started but is blocked during startup (agent_not_ready). ` +
+              "The name is available: use herdr_agent_read and herdr_agent_send_keys, " +
+              "and wait until it becomes idle before prompting.\n\n" +
+              errorMessage(started.error),
+          );
+        }
+        await cleanupCreated(created);
+        throw started.error;
+      }
+
+      if (a.focus === true) {
+        await runHerdr(["agent", "focus", name], { timeoutMs: ctx.timeoutMs });
+      }
+      return ok(started.text);
     },
   },
   {

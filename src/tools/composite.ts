@@ -1,39 +1,23 @@
 import { z } from "zod";
 import { runHerdr } from "../herdr.js";
-import { type ToolDef, type ToolResult, ok, formatResult, targetSchema } from "./types.js";
+import {
+  type ToolDef,
+  type ToolResult,
+  targetSchema,
+  statusEnum,
+  readSourceSchema,
+  ok,
+  formatResult,
+  resolvePaneId,
+} from "./types.js";
 
-/** Recursively find the first `pane_id` value in a parsed herdr JSON response. */
-function findPaneId(node: unknown): string | undefined {
-  if (!node || typeof node !== "object") return undefined;
-  if (Array.isArray(node)) {
-    for (const item of node) {
-      const found = findPaneId(item);
-      if (found) return found;
-    }
-    return undefined;
-  }
-  const obj = node as Record<string, unknown>;
-  if (typeof obj.pane_id === "string") return obj.pane_id;
-  for (const v of Object.values(obj)) {
-    const found = findPaneId(v);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-/** Resolve a target (agent name/label/id) to its pane id, needed to send keys.
- * Tries `agent get` first, then `pane get` so a raw pane id also works. */
-async function resolvePaneId(target: string): Promise<string> {
-  for (const cmd of [["agent", "get", target], ["pane", "get", target]]) {
-    try {
-      const res = await runHerdr(cmd);
-      const paneId = findPaneId(res.json);
-      if (paneId) return paneId;
-    } catch {
-      /* try next resolver */
-    }
-  }
-  throw new Error(`could not resolve pane_id for target "${target}"`);
+function untilFlags(argv: string[], statuses: unknown): void {
+  const values = Array.isArray(statuses)
+    ? statuses
+    : statuses
+      ? [statuses]
+      : [];
+  for (const status of values) argv.push("--until", String(status));
 }
 
 export const compositeTools: ToolDef[] = [
@@ -49,35 +33,42 @@ export const compositeTools: ToolDef[] = [
         .optional()
         .describe("Press Enter after typing (default true)."),
     },
-    run: async (a): Promise<ToolResult> => {
+    run: async (a, ctx): Promise<ToolResult> => {
       const target = String(a.target);
       const submit = a.submit !== false;
+      if (submit) {
+        await runHerdr(["agent", "prompt", target, String(a.text)], {
+          timeoutMs: ctx.timeoutMs,
+        });
+        return ok(`Delivered to "${target}" and submitted (Enter).`);
+      }
       // Resolve pane first so a bad target fails before we type anything.
-      const paneId = submit ? await resolvePaneId(target) : undefined;
-      await runHerdr(["agent", "send", target, String(a.text)]);
-      if (submit && paneId) await runHerdr(["pane", "send-keys", paneId, "enter"]);
-      return ok(
-        `Delivered to "${target}"${submit ? " and submitted (Enter)" : " (not submitted)"}.`,
-      );
+      const paneId = await resolvePaneId(target);
+      await runHerdr(["pane", "send-text", paneId, String(a.text)], {
+        timeoutMs: ctx.timeoutMs,
+      });
+      return ok(`Delivered to "${target}" (not submitted).`);
     },
   },
   {
     name: "herdr_handoff",
     description:
-      "Hand a task to another agent and wait for its result in one step: deliver the message (with Enter), wait until the agent reaches a status (default idle), then read its output back. Use this for review/fix/verify handoffs so the multi-step chain can't break midway. Returns the target agent's resulting output.",
+      "Hand a task to another agent and wait for its result in one step: deliver the message (with Enter), wait until the agent reaches a status (default idle, done or blocked), then read its output back. Use this for review/fix/verify handoffs so the multi-step chain can't break midway. Returns the target agent's resulting output.",
     inputSchema: {
       target: targetSchema,
       message: z.string().describe("Task/prompt to hand to the agent."),
-      wait_status: z
-        .enum(["idle", "working", "blocked", "done", "unknown"])
+      wait_status: statusEnum
         .optional()
-        .describe("Status to wait for before reading back (default: idle)."),
+        .describe("Status to wait for. Omit to use herdr's default (idle, done or blocked)."),
       timeout_ms: z
         .number()
         .int()
         .positive()
         .optional()
         .describe("Max time to wait for the status (default 120000)."),
+      read_source: readSourceSchema.describe(
+        "Which portion of the pane buffer to read back (default: visible). TUI agents pad the screen, so `recent` can miss the reply.",
+      ),
       read_lines: z
         .number()
         .int()
@@ -87,38 +78,47 @@ export const compositeTools: ToolDef[] = [
         .describe("Lines of output to read back (default 200)."),
     },
     timeoutMs: 180_000,
-    run: async (a): Promise<ToolResult> => {
+    run: async (a, ctx): Promise<ToolResult> => {
       const target = String(a.target);
-      const status = (a.wait_status as string) ?? "idle";
+      const statuses = a.wait_status;
       const timeout = (a.timeout_ms as number) ?? 120_000;
       const lines = (a.read_lines as number) ?? 200;
+      const readSource = (a.read_source as string) ?? "visible";
 
-      const paneId = await resolvePaneId(target);
-      await runHerdr(["agent", "send", target, String(a.message)]);
-      await runHerdr(["pane", "send-keys", paneId, "enter"]);
+      const argv = [
+        "agent",
+        "prompt",
+        target,
+        String(a.message),
+        "--wait",
+      ];
+      untilFlags(argv, statuses);
+      argv.push("--timeout", String(timeout));
 
-      let waitNote = `reached ${status}`;
+      let waitNote = statuses
+        ? `reached ${Array.isArray(statuses) ? statuses.join(", ") : statuses}`
+        : "reached idle, done or blocked";
       try {
-        await runHerdr(
-          ["agent", "wait", target, "--status", status, "--timeout", String(timeout)],
-          { timeoutMs: timeout + 10_000 },
-        );
+        await runHerdr(argv, { timeoutMs: ctx.timeoutMs });
       } catch (err) {
         // Don't lose the output if the wait times out — read whatever is there.
         waitNote = `wait did not complete (${err instanceof Error ? err.message : String(err)})`;
       }
 
-      const read = await runHerdr([
-        "agent",
-        "read",
-        target,
-        "--source",
-        "visible",
-        "--lines",
-        String(lines),
-        "--format",
-        "text",
-      ]);
+      const read = await runHerdr(
+        [
+          "agent",
+          "read",
+          target,
+          "--source",
+          readSource,
+          "--lines",
+          String(lines),
+          "--format",
+          "text",
+        ],
+        { timeoutMs: ctx.timeoutMs },
+      );
       return ok(`# Handoff to "${target}" — ${waitNote}\n\n${formatResult(read)}`);
     },
   },

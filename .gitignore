@@ -2,5 +2,9 @@ node_modules/
 *.log
 .serena/
 
+# OS / tooling scratch
+.DS_Store
+.superpowers/
+
 # dist/ is committed so `npm i -g github:...` works without a build step
 # (GitHub-based install, no npm registry). Rebuild with `npm run build`.
