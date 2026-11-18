@@ -75,6 +75,7 @@ Not style preferences — these encode how herdr itself behaves.
 ```bash
 npm install
 npx tsc --noEmit     # type check
+npm test             # unit tests (exact argv assertions)
 npm run build        # rebuild the committed dist/
 npm run dev          # run from source on stdio
 ```
